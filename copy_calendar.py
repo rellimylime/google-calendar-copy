@@ -1,375 +1,634 @@
-# python copy_calendar.py 10
+#!/usr/bin/env python3
+"""
+Google Calendar Copy Tool
 
+Copies events from a subscribed/shared calendar to your primary calendar.
+Useful when devices (like Garmin watches) only sync with calendars you own.
 
+Usage:
+    python copy_calendar.py copy [--limit N] [--test] [--dry-run]
+    python copy_calendar.py delete [--dry-run]
+    python copy_calendar.py list-calendars
+    python copy_calendar.py show-source [--limit N]
+    python copy_calendar.py show-copied
+"""
 
+# =============================================================================
+# CONFIGURATION - Edit these values to customize behavior
+# =============================================================================
+
+# REQUIRED: The calendar ID to copy events FROM
+# Find this in Google Calendar: Settings > [Calendar Name] > "Integrate calendar" section
+# Examples:
+#   - Resource calendar: 'c_1886ai526iqschc9mnpj6cu753n60@resource.calendar.google.com'
+#   - Shared calendar: 'someone@example.com'
+#   - Public calendar: 'en.usa#holiday@group.v.calendar.google.com'
+SOURCE_CALENDAR_ID = ''
+
+# Tag used to identify copied events (enables safe deletion of only copied events)
+# Change this if you want to use different tags for different source calendars
+COPY_TAG = 'copied_from_external'
+
+# -----------------------------------------------------------------------------
+# Event Field Options
+# -----------------------------------------------------------------------------
+
+# Copy the location field (room names, addresses, etc.)
+INCLUDE_LOCATION = True
+
+# Copy attendees to the new event
+# WARNING: This may trigger booking systems or cause confusion if the event
+# involves meeting rooms or resources that auto-accept based on attendees.
+# Default False is the safe choice for most use cases.
+INCLUDE_ATTENDEES = False
+
+# Send calendar notifications to attendees when events are created/modified
+# Only relevant if INCLUDE_ATTENDEES is True
+# WARNING: Setting this to True will send emails to all attendees!
+# This could confuse people or create duplicate notifications.
+SEND_NOTIFICATIONS = False
+
+# -----------------------------------------------------------------------------
+# Description Template
+# -----------------------------------------------------------------------------
+
+# How to format the copied event's description
+# Available placeholders:
+#   {copy_tag}            - The COPY_TAG value (for identification)
+#   {location}            - Original event location
+#   {attendees}           - Comma-separated list of attendee names/emails
+#   {original_description} - The original event description
+#
+# Set to None to keep only the original description (with copy tag prepended)
+#
+# Examples:
+#   Full info:     "[{copy_tag}]\nRoom: {location}\nGuests: {attendees}\n\n{original_description}"
+#   Minimal:       "[{copy_tag}]\n{original_description}"
+#   Just tag:      "[{copy_tag}]"
+DESCRIPTION_TEMPLATE = "[{copy_tag}]\nOriginal guests: {attendees}\n\n{original_description}"
+
+# -----------------------------------------------------------------------------
+# Time Range
+# -----------------------------------------------------------------------------
+
+# How far into the future to look for events (in days)
+# Set to 0 for no limit (copies all future events from source)
+FUTURE_DAYS = 365
+
+# =============================================================================
+# END OF CONFIGURATION - No need to edit below this line
+# =============================================================================
+
+import argparse
+import os.path
+import pickle
+import sys
+from datetime import datetime, timedelta
+
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-import os.path
-import pickle
 
+# OAuth scope - full calendar access required to create events
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-SOURCE_CALENDAR_ID = 'c_1886ai526iqschc9mnpj6cu753n60@resource.calendar.google.com'
-COPY_TAG = 'copied_from_external'
+
 
 def authenticate():
+    """
+    Authenticate with Google Calendar API using OAuth 2.0.
+
+    On first run, opens a browser for authentication. Subsequent runs
+    use the cached token in token.pickle.
+
+    Returns:
+        Credentials object for API calls
+
+    Raises:
+        FileNotFoundError: If credentials.json is missing
+    """
     creds = None
+
+    # Load cached credentials if they exist
     if os.path.exists('token.pickle'):
         with open('token.pickle', 'rb') as token:
             creds = pickle.load(token)
-    
+
+    # Refresh or get new credentials if needed
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            print("Refreshing access token...")
             creds.refresh(Request())
         else:
+            if not os.path.exists('credentials.json'):
+                print("Error: credentials.json not found!")
+                print("\nTo set up authentication:")
+                print("1. Go to https://console.cloud.google.com/")
+                print("2. Create a project and enable the Google Calendar API")
+                print("3. Create OAuth 2.0 credentials (Desktop application)")
+                print("4. Download and save as 'credentials.json' in this directory")
+                sys.exit(1)
+
+            print("Opening browser for authentication...")
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
+
+        # Save credentials for next run
         with open('token.pickle', 'wb') as token:
             pickle.dump(creds, token)
-    
+
     return creds
 
-def copy_events(limit=5):
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    from datetime import datetime, timedelta
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
-    far_future = (datetime.now() + timedelta(days=365*2)).isoformat() + 'Z'
-    
-    # Get existing events from your calendar - check future events with pagination
-    print("Checking existing events...")
-    existing_summaries = set()
+
+def validate_config():
+    """
+    Validate configuration and warn about potentially risky settings.
+
+    Returns:
+        bool: True if configuration is valid, False otherwise
+    """
+    if not SOURCE_CALENDAR_ID:
+        print("Error: SOURCE_CALENDAR_ID is not set!")
+        print("\nEdit copy_calendar.py and set SOURCE_CALENDAR_ID to your source calendar's ID.")
+        print("Find the calendar ID in Google Calendar:")
+        print("  Settings > [Calendar Name] > 'Integrate calendar' section")
+        return False
+
+    # Warn about risky combinations
+    if INCLUDE_ATTENDEES and SEND_NOTIFICATIONS:
+        print("=" * 60)
+        print("WARNING: INCLUDE_ATTENDEES and SEND_NOTIFICATIONS are both enabled!")
+        print("This will send calendar invitations to all attendees on copied events.")
+        print("=" * 60)
+        response = input("Are you sure you want to continue? (yes/no): ")
+        if response.lower() != 'yes':
+            print("Aborted.")
+            return False
+
+    return True
+
+
+def build_description(event):
+    """
+    Build the description for a copied event using the template.
+
+    Args:
+        event: The source event dictionary from Google Calendar API
+
+    Returns:
+        str: The formatted description
+    """
+    if DESCRIPTION_TEMPLATE is None:
+        # Just prepend the copy tag to original description
+        original = event.get('description', '')
+        return f"[{COPY_TAG}]\n{original}" if original else f"[{COPY_TAG}]"
+
+    # Gather values for template placeholders
+    attendees = event.get('attendees', [])
+    attendee_names = ', '.join([
+        a.get('displayName', a.get('email', ''))
+        for a in attendees
+    ])
+
+    values = {
+        'copy_tag': COPY_TAG,
+        'location': event.get('location', ''),
+        'attendees': attendee_names,
+        'original_description': event.get('description', ''),
+    }
+
+    try:
+        return DESCRIPTION_TEMPLATE.format(**values)
+    except KeyError as e:
+        print(f"Warning: Unknown placeholder in DESCRIPTION_TEMPLATE: {e}")
+        return f"[{COPY_TAG}]\n{event.get('description', '')}"
+
+
+def get_existing_events(service, time_min, time_max):
+    """
+    Fetch existing events from primary calendar to check for duplicates.
+
+    Args:
+        service: Google Calendar API service object
+        time_min: ISO format start time
+        time_max: ISO format end time
+
+    Returns:
+        set: Set of (summary, start_time) tuples for duplicate detection
+    """
+    print("Checking for existing events...")
+    existing = set()
     page_token = None
     pages = 0
-    
+
     while True:
-        existing = service.events().list(
+        events = service.events().list(
             calendarId='primary',
             maxResults=2500,
-            timeMin=today,
-            timeMax=far_future,
+            timeMin=time_min,
+            timeMax=time_max,
             singleEvents=True,
             pageToken=page_token
         ).execute()
-        
-        for e in existing.get('items', []):
-            existing_summaries.add((e.get('summary'), str(e.get('start'))))
-        
-        page_token = existing.get('nextPageToken')
+
+        for e in events.get('items', []):
+            existing.add((e.get('summary'), str(e.get('start'))))
+
+        page_token = events.get('nextPageToken')
         pages += 1
-        
-        if not page_token or pages >= 3:  # Check up to ~7500 events
+
+        if not page_token or pages >= 5:
             break
-    
-    print(f"Found {len(existing_summaries)} existing events on your calendar")
-    
-    # Get events from source calendar - ONLY from today onwards, IN CHRONOLOGICAL ORDER
-    print("Fetching source calendar events...")
-    
-    source_events = service.events().list(
-        calendarId=SOURCE_CALENDAR_ID, 
-        maxResults=2500, 
-        singleEvents=True,
-        orderBy='startTime',
-        timeMin=today
-    ).execute()
-    
-    print(f"Found {len(source_events.get('items', []))} events from source")
-    print(f"Will copy up to {limit} events in chronological order\n")
-    
-    copied = 0
-    failed = 0
-    for event in source_events.get('items', []):
-        if copied >= limit:
-            print(f"\nReached limit of {limit} events")
-            break
-            
-        event_key = (event.get('summary'), str(event.get('start')))
-        if event_key not in existing_summaries:
-            try:
-                # Extract room/resource info
-                room_info = event.get('location', '')
-                
-                # Extract guest names as plain text
-                attendees = event.get('attendees', [])
-                guest_text = ', '.join([a.get('displayName', a.get('email', '')) for a in attendees])
-                
-                # Build ONLY these fields - NOTHING else
-                new_event = {
-                    'summary': event.get('summary', ''),
-                    'location': room_info,
-                    'description': f"[{COPY_TAG}]\nOriginal guests: {guest_text}\n\n{event.get('description', '')}",
-                    'start': event.get('start'),
-                    'end': event.get('end'),
-                }
-                
-                result = service.events().insert(
-                    calendarId='primary', 
-                    body=new_event,
-                    sendNotifications=False
-                ).execute()
-                
-                print(f"Copied: {new_event.get('summary')} (Start: {event.get('start')})")
-                copied += 1
-                    
-            except Exception as e:
-                print(f"Failed: {e}")
-                failed += 1
-    
-    print(f"\nDone! Copied {copied} events, failed {failed}.")
-    
-def delete_copied_events():
+
+    return existing
+
+
+def copy_events(limit=None, dry_run=False):
+    """
+    Copy events from source calendar to primary calendar.
+
+    Args:
+        limit: Maximum number of events to copy (None for no limit)
+        dry_run: If True, show what would be copied without making changes
+
+    Returns:
+        tuple: (copied_count, skipped_count, failed_count)
+    """
+    if not validate_config():
+        return (0, 0, 0)
+
     creds = authenticate()
     service = build('calendar', 'v3', credentials=creds)
-    
+
+    # Calculate time range
+    now = datetime.now()
+    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+
+    if FUTURE_DAYS > 0:
+        time_max = (now + timedelta(days=FUTURE_DAYS)).isoformat() + 'Z'
+    else:
+        time_max = (now + timedelta(days=365 * 5)).isoformat() + 'Z'  # 5 years max
+
+    # Get existing events for duplicate checking
+    existing = get_existing_events(service, time_min, time_max)
+    print(f"Found {len(existing)} existing events on primary calendar")
+
+    # Fetch source calendar events
+    print(f"\nFetching events from source calendar...")
+    source_events = service.events().list(
+        calendarId=SOURCE_CALENDAR_ID,
+        maxResults=2500,
+        singleEvents=True,
+        orderBy='startTime',
+        timeMin=time_min,
+        timeMax=time_max if FUTURE_DAYS > 0 else None
+    ).execute()
+
+    items = source_events.get('items', [])
+    print(f"Found {len(items)} events on source calendar")
+
+    if not items:
+        print("No events to copy.")
+        return (0, 0, 0)
+
+    if limit:
+        print(f"Will process up to {limit} events")
+
+    if dry_run:
+        print("\n[DRY RUN - No changes will be made]\n")
+
+    # Process events
+    copied = 0
+    skipped = 0
+    failed = 0
+
+    for i, event in enumerate(items):
+        if limit and copied >= limit:
+            print(f"\nReached limit of {limit} events")
+            break
+
+        event_key = (event.get('summary'), str(event.get('start')))
+        summary = event.get('summary', '(no title)')
+        start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', ''))
+
+        # Check for duplicates
+        if event_key in existing:
+            skipped += 1
+            continue
+
+        if dry_run:
+            print(f"  Would copy: {summary} ({start})")
+            copied += 1
+            continue
+
+        # Build the new event
+        new_event = {
+            'summary': event.get('summary', ''),
+            'description': build_description(event),
+            'start': event.get('start'),
+            'end': event.get('end'),
+        }
+
+        if INCLUDE_LOCATION and event.get('location'):
+            new_event['location'] = event.get('location')
+
+        if INCLUDE_ATTENDEES and event.get('attendees'):
+            new_event['attendees'] = event.get('attendees')
+
+        try:
+            service.events().insert(
+                calendarId='primary',
+                body=new_event,
+                sendNotifications=SEND_NOTIFICATIONS
+            ).execute()
+
+            print(f"  Copied: {summary} ({start})")
+            copied += 1
+
+        except Exception as e:
+            print(f"  Failed: {summary} - {e}")
+            failed += 1
+
+    # Summary
+    print(f"\n{'[DRY RUN] ' if dry_run else ''}Summary:")
+    print(f"  Copied: {copied}")
+    print(f"  Skipped (duplicates): {skipped}")
+    if failed:
+        print(f"  Failed: {failed}")
+
+    return (copied, skipped, failed)
+
+
+def delete_copied_events(dry_run=False):
+    """
+    Delete all events that were created by this tool (identified by COPY_TAG).
+
+    Args:
+        dry_run: If True, show what would be deleted without making changes
+
+    Returns:
+        int: Number of events deleted
+    """
+    creds = authenticate()
+    service = build('calendar', 'v3', credentials=creds)
+
     print("Finding copied events...")
-    from datetime import datetime
-    today = datetime.now().isoformat() + 'Z'
-    
+    now = datetime.now()
+    time_min = (now - timedelta(days=30)).isoformat() + 'Z'  # Include recent past
+
+    # Collect all events with pagination
     all_events = []
     page_token = None
     pages = 0
-    
+
     while True:
         events = service.events().list(
-            calendarId='primary', 
+            calendarId='primary',
             maxResults=2500,
-            timeMin=today,
+            timeMin=time_min,
             singleEvents=True,
             pageToken=page_token
         ).execute()
-        
+
         all_events.extend(events.get('items', []))
         page_token = events.get('nextPageToken')
         pages += 1
-        
-        print(f"Fetched page {pages}, total events so far: {len(all_events)}")
-        
-        if not page_token or pages >= 5:  # Safety limit
+
+        if not page_token or pages >= 10:
             break
-    
-    print(f"Total events retrieved: {len(all_events)}")
-    
-    deleted = 0
+
+    # Find events with our tag
+    to_delete = []
     for event in all_events:
         description = event.get('description', '')
-        if COPY_TAG in description:
-            try:
-                service.events().delete(calendarId='primary', eventId=event['id']).execute()
-                print(f"Deleted: {event.get('summary')}")
-                deleted += 1
-            except Exception as e:
-                print(f"Failed to delete {event.get('summary')}: {e}")
-    
-    print(f"\nDone! Deleted {deleted} copied events.")
+        if f'[{COPY_TAG}]' in description:
+            to_delete.append(event)
 
-def inspect_event():
+    if not to_delete:
+        print(f"No events found with tag [{COPY_TAG}]")
+        return 0
+
+    print(f"\nFound {len(to_delete)} copied events:")
+    for event in to_delete[:10]:  # Show first 10
+        summary = event.get('summary', '(no title)')
+        start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', ''))
+        print(f"  - {summary} ({start})")
+
+    if len(to_delete) > 10:
+        print(f"  ... and {len(to_delete) - 10} more")
+
+    if dry_run:
+        print(f"\n[DRY RUN] Would delete {len(to_delete)} events")
+        return len(to_delete)
+
+    # Confirmation prompt
+    print()
+    response = input(f"Delete {len(to_delete)} events? (yes/no): ")
+    if response.lower() != 'yes':
+        print("Aborted.")
+        return 0
+
+    # Delete events
+    deleted = 0
+    for event in to_delete:
+        try:
+            service.events().delete(
+                calendarId='primary',
+                eventId=event['id'],
+                sendNotifications=False
+            ).execute()
+            deleted += 1
+            print(f"  Deleted: {event.get('summary', '(no title)')}")
+        except Exception as e:
+            print(f"  Failed to delete {event.get('summary')}: {e}")
+
+    print(f"\nDeleted {deleted} events")
+    return deleted
+
+
+def list_calendars():
+    """
+    List all calendars accessible to the authenticated account.
+    Useful for finding the correct SOURCE_CALENDAR_ID.
+    """
     creds = authenticate()
     service = build('calendar', 'v3', credentials=creds)
-    
-    source_events = service.events().list(calendarId=SOURCE_CALENDAR_ID, maxResults=1).execute()
-    event = source_events.get('items', [])[0]
-    
-    print("Event fields:")
-    for key, value in event.items():
-        print(f"{key}: {value}")
 
-def inspect_copied_event():
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    events = service.events().list(calendarId='primary', maxResults=50).execute()
-    
-    for event in events.get('items', []):
-        if COPY_TAG in event.get('description', ''):
-            print("Copied event fields:")
-            for key, value in event.items():
-                print(f"{key}: {value}")
-            break
-
-def check_auth():
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    # Get calendar list to see which account
     calendar_list = service.calendarList().list().execute()
-    
-    print("Authenticated calendars:")
+
+    print("\nAccessible calendars:\n")
     for cal in calendar_list.get('items', []):
-        print(f"- {cal.get('summary')} ({cal.get('id')})")
-        if cal.get('primary'):
-            print("  ^ This is your primary calendar")
-    
-    # Check recent events on primary
-    print("\nRecent events on primary calendar:")
-    events = service.events().list(calendarId='primary', maxResults=5, orderBy='updated').execute()
-    for event in events.get('items', []):
-        print(f"- {event.get('summary')} (ID: {event.get('id')})")
+        name = cal.get('summary', '(unnamed)')
+        cal_id = cal.get('id')
+        primary = ' [PRIMARY]' if cal.get('primary') else ''
+        access = cal.get('accessRole', '')
 
-def show_recent():
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    from datetime import datetime, timedelta
-    today = datetime.now()
-    week_ago = (today - timedelta(days=7)).strftime('%Y-%m-%dT00:00:00Z')
-    
-    events = service.events().list(
-        calendarId='primary',
-        timeMin=week_ago,
-        maxResults=20,
-        singleEvents=True,
-        orderBy='startTime'
-    ).execute()
-    
-    print(f"\nYour upcoming events:")
-    for event in events.get('items', []):
-        print(f"\n{event.get('summary')}")
-        print(f"  Start: {event.get('start')}")
-        print(f"  Attendees: {event.get('attendees', 'None')}")
-        desc = event.get('description', '')
-        if COPY_TAG in desc:
-            print(f"  *** This is a copied event ***")
-
-def diagnose():
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    # Get ALL events including far future ones
-    print("Searching ALL events on primary calendar...")
-    from datetime import datetime, timedelta
-    today = datetime.now()
-    far_future = (today + timedelta(days=365*2)).isoformat() + 'Z'  # 2 years out
-    
-    events = service.events().list(
-        calendarId='primary', 
-        maxResults=2500,
-        timeMax=far_future
-    ).execute()
-    
-    print(f"Total events retrieved: {len(events.get('items', []))}")
-    
-    # Find events with our tag
-    tagged = []
-    for event in events.get('items', []):
-        if COPY_TAG in event.get('description', ''):
-            tagged.append(event)
-    
-    print(f"\nEvents with [{COPY_TAG}] tag: {len(tagged)}")
-    for e in tagged:
-        print(f"- {e.get('summary')}")
-    
-    # Look specifically for S26
-    print("\n\nSearching for 'S26' events:")
-    for event in events.get('items', []):
-        if 'S26' in event.get('summary', ''):
-            print(f"\nFound: {event.get('summary')}")
-            print(f"ID: {event.get('id')}")
-            print(f"Start: {event.get('start')}")
-            print(f"Description: {event.get('description', 'NONE')[:300]}")
-
-def delete_test():
-    """Delete the test event we copied"""
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    events = service.events().list(calendarId='primary', maxResults=2500).execute()
-    
-    for event in events.get('items', []):
-        if 'S26' in event.get('summary', ''):
-            summary = event.get('summary')
-            event_id = event.get('id')
-            print(f"Deleting: {summary}")
-            try:
-                service.events().delete(calendarId='primary', eventId=event_id).execute()
-                print("Deleted successfully")
-            except Exception as e:
-                print(f"Failed to delete: {e}")
-
-def show_source():
-    """Show events from source calendar"""
-    creds = authenticate()
-    service = build('calendar', 'v3', credentials=creds)
-    
-    from datetime import datetime
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
-    
-    print(f"Events in source calendar from today onwards:")
-    source_events = service.events().list(
-        calendarId=SOURCE_CALENDAR_ID, 
-        maxResults=50,
-        singleEvents=True,
-        timeMin=today,
-        orderBy='startTime'
-    ).execute()
-    
-    print(f"\nFound {len(source_events.get('items', []))} events\n")
-    
-    for event in source_events.get('items', []):
-        print(f"{event.get('summary')}")
-        print(f"  Start: {event.get('start')}")
-        print(f"  Location: {event.get('location', 'None')}")
-        print(f"  Attendees: {len(event.get('attendees', []))}")
-        desc = event.get('description', '')
-        print(f"  Description: {desc[:100] if desc else 'None'}")
+        print(f"  {name}{primary}")
+        print(f"    ID: {cal_id}")
+        print(f"    Access: {access}")
         print()
 
-def find_by_id():
-    """Find the most recently copied event by ID"""
+
+def show_source(limit=10):
+    """
+    Show upcoming events from the source calendar.
+
+    Args:
+        limit: Maximum number of events to display
+    """
+    if not SOURCE_CALENDAR_ID:
+        print("Error: SOURCE_CALENDAR_ID is not set")
+        return
+
     creds = authenticate()
     service = build('calendar', 'v3', credentials=creds)
-    
-    # Use the ID from the last copy operation
-    event_id = "ghl8qbf1383ro6p5mitev5qj4o"
-    
-    # Get all calendars
-    calendar_list = service.calendarList().list().execute()
-    
-    print(f"\nSearching for event {event_id}...\n")
-    
-    for cal in calendar_list.get('items', []):
-        cal_id = cal.get('id')
-        cal_name = cal.get('summary')
-        try:
-            event = service.events().get(calendarId=cal_id, eventId=event_id).execute()
-            print(f"FOUND on calendar: {cal_name}")
-            print(f"Summary: {event.get('summary')}")
-            print(f"Start: {event.get('start')}")
-            print(f"Description: {event.get('description', 'NONE')[:200]}")
-            return
-        except:
-            pass
-    
-    print("Event not found on any calendar")
+
+    now = datetime.now()
+    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+
+    print(f"\nUpcoming events from source calendar:\n")
+
+    try:
+        events = service.events().list(
+            calendarId=SOURCE_CALENDAR_ID,
+            maxResults=limit,
+            singleEvents=True,
+            orderBy='startTime',
+            timeMin=time_min
+        ).execute()
+    except Exception as e:
+        print(f"Error accessing source calendar: {e}")
+        print("\nMake sure:")
+        print("  - The calendar ID is correct")
+        print("  - You have access to this calendar")
+        print("  - The calendar is visible in your Google Calendar")
+        return
+
+    items = events.get('items', [])
+    if not items:
+        print("No upcoming events found.")
+        return
+
+    for event in items:
+        summary = event.get('summary', '(no title)')
+        start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', ''))
+        location = event.get('location', '')
+        attendees = event.get('attendees', [])
+
+        print(f"  {summary}")
+        print(f"    Start: {start}")
+        if location:
+            print(f"    Location: {location}")
+        if attendees:
+            print(f"    Attendees: {len(attendees)}")
+        print()
+
+
+def show_copied(limit=10):
+    """
+    Show events that were copied by this tool.
+
+    Args:
+        limit: Maximum number of events to display
+    """
+    creds = authenticate()
+    service = build('calendar', 'v3', credentials=creds)
+
+    now = datetime.now()
+    time_min = (now - timedelta(days=7)).isoformat() + 'Z'
+
+    events = service.events().list(
+        calendarId='primary',
+        maxResults=100,
+        singleEvents=True,
+        orderBy='startTime',
+        timeMin=time_min
+    ).execute()
+
+    print(f"\nCopied events (tag: [{COPY_TAG}]):\n")
+
+    found = 0
+    for event in events.get('items', []):
+        if f'[{COPY_TAG}]' in event.get('description', ''):
+            if found >= limit:
+                print(f"  ... and more (use --limit to see more)")
+                break
+
+            summary = event.get('summary', '(no title)')
+            start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', ''))
+            print(f"  {summary}")
+            print(f"    Start: {start}")
+            print()
+            found += 1
+
+    if found == 0:
+        print("  No copied events found.")
+
+
+def main():
+    """Main entry point with argument parsing."""
+    parser = argparse.ArgumentParser(
+        description='Copy events from a shared/subscribed calendar to your primary calendar.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python copy_calendar.py copy                  Copy all future events
+  python copy_calendar.py copy --limit 5        Copy up to 5 events
+  python copy_calendar.py copy --test           Copy just 1 event (for testing)
+  python copy_calendar.py copy --dry-run        Show what would be copied
+  python copy_calendar.py delete                Delete all copied events
+  python copy_calendar.py delete --dry-run      Show what would be deleted
+  python copy_calendar.py list-calendars        List accessible calendars
+  python copy_calendar.py show-source           Show source calendar events
+  python copy_calendar.py show-copied           Show copied events
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+
+    # Copy command
+    copy_parser = subparsers.add_parser('copy', help='Copy events from source to primary calendar')
+    copy_parser.add_argument('--limit', type=int, help='Maximum number of events to copy')
+    copy_parser.add_argument('--test', action='store_true', help='Copy only 1 event (for testing)')
+    copy_parser.add_argument('--dry-run', action='store_true', help='Show what would be copied without making changes')
+
+    # Delete command
+    delete_parser = subparsers.add_parser('delete', help='Delete all copied events')
+    delete_parser.add_argument('--dry-run', action='store_true', help='Show what would be deleted without making changes')
+
+    # List calendars command
+    subparsers.add_parser('list-calendars', help='List all accessible calendars')
+
+    # Show source command
+    show_source_parser = subparsers.add_parser('show-source', help='Show events from source calendar')
+    show_source_parser.add_argument('--limit', type=int, default=10, help='Number of events to show')
+
+    # Show copied command
+    show_copied_parser = subparsers.add_parser('show-copied', help='Show events copied by this tool')
+    show_copied_parser.add_argument('--limit', type=int, default=10, help='Number of events to show')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == 'copy':
+        limit = 1 if args.test else args.limit
+        copy_events(limit=limit, dry_run=args.dry_run)
+
+    elif args.command == 'delete':
+        delete_copied_events(dry_run=args.dry_run)
+
+    elif args.command == 'list-calendars':
+        list_calendars()
+
+    elif args.command == 'show-source':
+        show_source(limit=args.limit)
+
+    elif args.command == 'show-copied':
+        show_copied(limit=args.limit)
+
 
 if __name__ == '__main__':
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == 'delete':
-        delete_copied_events()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'inspect':
-        inspect_event()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'inspect-copied':
-        inspect_copied_event()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'check':
-        check_auth()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'recent':
-        show_recent()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'diagnose':
-        diagnose()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'delete-test':
-        delete_test()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'show-source':
-        show_source()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'find-by-id':
-        find_by_id()
-    else:
-        # Allow optional limit argument: python copy_calendar.py 10
-        limit = 5  # default
-        if len(sys.argv) > 1:
-            try:
-                limit = int(sys.argv[1])
-            except ValueError:
-                print(f"Invalid limit: {sys.argv[1]}, using default of 5")
-        copy_events(limit=limit)
+    main()
