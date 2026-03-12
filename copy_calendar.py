@@ -6,7 +6,7 @@ Copies events from a subscribed/shared calendar to your primary calendar.
 Useful when devices (like Garmin watches) only sync with calendars you own.
 
 Usage:
-    python copy_calendar.py copy [--limit N] [--test] [--dry-run]
+    python copy_calendar.py copy [--limit N] [--test] [--dry-run] [--until YYYY-MM-DD]
     python copy_calendar.py delete [--dry-run]
     python copy_calendar.py list-calendars
     python copy_calendar.py show-source [--limit N]
@@ -23,7 +23,8 @@ Usage:
 #   - Resource calendar: 'c_1886ai526iqschc9mnpj6cu753n60@resource.calendar.google.com'
 #   - Shared calendar: 'someone@example.com'
 #   - Public calendar: 'en.usa#holiday@group.v.calendar.google.com'
-SOURCE_CALENDAR_ID = ''
+SOURCE_CALENDAR_ID = 'c_1886ai526iqschc9mnpj6cu753n60@resource.calendar.google.com'
+
 
 # Tag used to identify copied events (enables safe deletion of only copied events)
 # Change this if you want to use different tags for different source calendars
@@ -85,6 +86,7 @@ import pickle
 import sys
 from datetime import datetime, timedelta
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -92,6 +94,18 @@ from googleapiclient.discovery import build
 
 # OAuth scope - full calendar access required to create events
 SCOPES = ['https://www.googleapis.com/auth/calendar']
+TOKEN_FILE = 'token.pickle'
+CREDENTIALS_FILE = 'credentials.json'
+
+
+def parse_until_date(value):
+    """Parse --until argument as YYYY-MM-DD."""
+    try:
+        return datetime.strptime(value, '%Y-%m-%d')
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"Invalid date '{value}'. Use YYYY-MM-DD format."
+        ) from error
 
 
 def authenticate():
@@ -110,17 +124,39 @@ def authenticate():
     creds = None
 
     # Load cached credentials if they exist
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
 
     # Refresh or get new credentials if needed
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             print("Refreshing access token...")
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as error:
+                if 'invalid_grant' not in str(error):
+                    raise
+                # Token was revoked/expired server-side. Remove cache and re-auth.
+                print(f"Stored token is no longer valid ({error}).")
+                print("Opening browser for re-authentication...")
+                if os.path.exists(TOKEN_FILE):
+                    try:
+                        os.remove(TOKEN_FILE)
+                    except OSError:
+                        pass
+                if not os.path.exists(CREDENTIALS_FILE):
+                    print("Error: credentials.json not found!")
+                    print("\nTo set up authentication:")
+                    print("1. Go to https://console.cloud.google.com/")
+                    print("2. Create a project and enable the Google Calendar API")
+                    print("3. Create OAuth 2.0 credentials (Desktop application)")
+                    print("4. Download and save as 'credentials.json' in this directory")
+                    sys.exit(1)
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+                creds = flow.run_local_server(port=0)
         else:
-            if not os.path.exists('credentials.json'):
+            if not os.path.exists(CREDENTIALS_FILE):
                 print("Error: credentials.json not found!")
                 print("\nTo set up authentication:")
                 print("1. Go to https://console.cloud.google.com/")
@@ -130,11 +166,11 @@ def authenticate():
                 sys.exit(1)
 
             print("Opening browser for authentication...")
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
         # Save credentials for next run
-        with open('token.pickle', 'wb') as token:
+        with open(TOKEN_FILE, 'wb') as token:
             pickle.dump(creds, token)
 
     return creds
@@ -243,13 +279,14 @@ def get_existing_events(service, time_min, time_max):
     return existing
 
 
-def copy_events(limit=None, dry_run=False):
+def copy_events(limit=None, dry_run=False, until=None):
     """
     Copy events from source calendar to primary calendar.
 
     Args:
         limit: Maximum number of events to copy (None for no limit)
         dry_run: If True, show what would be copied without making changes
+        until: Inclusive end date (datetime at 00:00 local time)
 
     Returns:
         tuple: (copied_count, skipped_count, failed_count)
@@ -262,12 +299,22 @@ def copy_events(limit=None, dry_run=False):
 
     # Calculate time range
     now = datetime.now()
-    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+    time_min_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    if FUTURE_DAYS > 0:
-        time_max = (now + timedelta(days=FUTURE_DAYS)).isoformat() + 'Z'
+    if until:
+        # Google Calendar API treats timeMax as exclusive, so add 1 day.
+        time_max_dt = until + timedelta(days=1)
+    elif FUTURE_DAYS > 0:
+        time_max_dt = now + timedelta(days=FUTURE_DAYS)
     else:
-        time_max = (now + timedelta(days=365 * 5)).isoformat() + 'Z'  # 5 years max
+        time_max_dt = now + timedelta(days=365 * 5)  # 5 years max
+
+    if time_max_dt <= time_min_dt:
+        print(f"No events to copy: --until {until.strftime('%Y-%m-%d')} is before today.")
+        return (0, 0, 0)
+
+    time_min = time_min_dt.isoformat() + 'Z'
+    time_max = time_max_dt.isoformat() + 'Z'
 
     # Get existing events for duplicate checking
     existing = get_existing_events(service, time_min, time_max)
@@ -281,7 +328,7 @@ def copy_events(limit=None, dry_run=False):
         singleEvents=True,
         orderBy='startTime',
         timeMin=time_min,
-        timeMax=time_max if FUTURE_DAYS > 0 else None
+        timeMax=time_max if FUTURE_DAYS > 0 or until else None
     ).execute()
 
     items = source_events.get('items', [])
@@ -575,6 +622,7 @@ Examples:
   python copy_calendar.py copy                  Copy all future events
   python copy_calendar.py copy --limit 5        Copy up to 5 events
   python copy_calendar.py copy --test           Copy just 1 event (for testing)
+  python copy_calendar.py copy --until 2026-06-30  Copy events through a date
   python copy_calendar.py copy --dry-run        Show what would be copied
   python copy_calendar.py delete                Delete all copied events
   python copy_calendar.py delete --dry-run      Show what would be deleted
@@ -590,6 +638,7 @@ Examples:
     copy_parser = subparsers.add_parser('copy', help='Copy events from source to primary calendar')
     copy_parser.add_argument('--limit', type=int, help='Maximum number of events to copy')
     copy_parser.add_argument('--test', action='store_true', help='Copy only 1 event (for testing)')
+    copy_parser.add_argument('--until', type=parse_until_date, help='Copy events through this date (YYYY-MM-DD, inclusive)')
     copy_parser.add_argument('--dry-run', action='store_true', help='Show what would be copied without making changes')
 
     # Delete command
@@ -615,7 +664,7 @@ Examples:
 
     if args.command == 'copy':
         limit = 1 if args.test else args.limit
-        copy_events(limit=limit, dry_run=args.dry_run)
+        copy_events(limit=limit, dry_run=args.dry_run, until=args.until)
 
     elif args.command == 'delete':
         delete_copied_events(dry_run=args.dry_run)
